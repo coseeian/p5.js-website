@@ -29,15 +29,15 @@ const { title, items, class: className } = Astro.props;
       {
         items.map((i) => {
           if (isCurationResponse(i)) {
-            return <GridItemSketch item={i} />;
+            return <li><GridItemSketch item={i} /></li>;
           }
           switch (i.collection) {
             case "reference":
-              return <GridItemReference item={i} />;
+              return <li><GridItemReference item={i} /></li>;
             case "examples":
-              return <GridItemExample item={i} />;
+              return <li><GridItemExample item={i} /></li>;
             case "events":
-              return <GridItemEvent item={i} />;
+              return <li><GridItemEvent item={i} /></li>;
           }
         })
       }
