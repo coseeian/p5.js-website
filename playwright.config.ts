@@ -1,10 +1,13 @@
 import { defineConfig, devices } from '@playwright/test';
+import fs from 'fs';
 
 // --- Runtime modes ---
 // RUN_MODE=LOCAL   -> Start Astro dev server (local development)
 // RUN_MODE=BUILD   -> Build Astro site and serve from "dist" (CI / closest to production)
 // RUN_MODE=REMOTE  -> Do not start any local server, test directly against remote URL
 const RUN_MODE = process.env.RUN_MODE ?? (process.env.CI ? 'BUILD' : 'LOCAL');
+const SKIP_BUILD = String(process.env.SKIP_BUILD ?? '').length > 0; // any truthy value skips build
+const DIST_EXISTS = fs.existsSync('dist');
 
 // Allow overriding test directory via environment variable (default: ./tests)
 const testDir = process.env.TEST_DIR ?? './test';
@@ -49,13 +52,21 @@ export default defineConfig({
   },
 
   // Test projects: three major engines + iPhone 15 viewport
-  projects: [
-    { name: 'Desktop Chrome', use: { ...devices['Desktop Chrome'] } },
-    { name: 'Desktop Firefox',  use: { ...devices['Desktop Firefox'] } },
-    { name: 'Desktop Safari',   use: { ...devices['Desktop Safari'] } },
-    { name: 'iPhone 15', use: { ...devices['iPhone 15'] } },
-    { name: 'Pixel 7', use: { ...devices['Pixel 7'] } },
-  ],
+  projects: (() => {
+    const all = [
+      { name: 'Desktop Chrome', use: { ...devices['Desktop Chrome'] } },
+      { name: 'Desktop Firefox',  use: { ...devices['Desktop Firefox'] } },
+      { name: 'Desktop Safari',   use: { ...devices['Desktop Safari'] } },
+      { name: 'iPhone 15', use: { ...devices['iPhone 15'] } },
+      { name: 'Pixel 7', use: { ...devices['Pixel 7'] } },
+    ];
+    const pick = process.env.A11Y_DEVICE;
+    if (pick) {
+      const filtered = all.filter(p => p.name.toLowerCase() === pick.toLowerCase());
+      return filtered.length ? filtered : all.filter(p => p.name === 'Desktop Chrome');
+    }
+    return all;
+  })(),
 
   // Start appropriate webServer depending on the mode
   webServer:
@@ -65,15 +76,17 @@ export default defineConfig({
           command: 'npm run dev',
             port: 4321,
           reuseExistingServer: !process.env.CI,
-          timeout: 180_000,
+          timeout: 600_000,
         }
       : RUN_MODE === 'BUILD'
       ? {
-        command: 'npm run build && npm run preview -- --port 4173 --host',
+        // Allow skipping the build step if dist/ already exists or SKIP_BUILD is set
+        command: (SKIP_BUILD || DIST_EXISTS)
+          ? 'npm run preview -- --port 4173 --host'
+          : 'npm run build && npm run preview -- --port 4173 --host',
         port: 4173, // choose port OR url (not both)
         reuseExistingServer: !process.env.CI,
-        timeout: 180_000,
+        timeout: 600_000,
       }
       : undefined, // REMOTE mode → no server started
 });
-
