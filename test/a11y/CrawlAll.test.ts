@@ -45,6 +45,22 @@ test.describe("a11y-crawl-all", () => {
   // Optional filters to speed up or target specific locales in CI/local runs
   const onlyLocale = process.env.A11Y_LOCALE; // e.g., "es" to test only /es/... routes
   const maxPages = Number(process.env.A11Y_MAX_PAGES || 0); // limit number of pages
+  const routePrefixRaw =
+    process.env.A11Y_ROUTE_PREFIX ||
+    process.env.A11Y_PREFIX ||
+    process.env.A11Y_ROUTE_STARTS_WITH ||
+    "";
+
+  const normalizePrefix = (p: string): string | null => {
+    const s = (p || "").trim();
+    if (!s) return null;
+    let out = s.startsWith("/") ? s : `/${s}`;
+    // collapse repeated slashes and ensure trailing slash (except root)
+    out = out.replace(/\/{2,}/g, "/");
+    if (out !== "/" && !out.endsWith("/")) out += "/";
+    return out;
+  };
+  const routePrefix = normalizePrefix(routePrefixRaw);
 
   const filtered = allRoutes.filter((r) => {
     if (!onlyLocale) return true;
@@ -53,7 +69,17 @@ test.describe("a11y-crawl-all", () => {
     return r.startsWith(`/${onlyLocale}/`);
   });
 
-  const targetRoutes = maxPages > 0 ? filtered.slice(0, maxPages) : filtered;
+  const filteredByPrefix = routePrefix ? filtered.filter((r) => r.startsWith(routePrefix)) : filtered;
+
+  const targetRoutes = maxPages > 0 ? filteredByPrefix.slice(0, maxPages) : filteredByPrefix;
+
+  // --- Per-run timestamped output directory (YYYY-MM-DD-HH-mm-ss) ---
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const formatTs = (d = new Date()) =>
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+  const RUN_TS = formatTs();
+  const outRoot = path.resolve(process.cwd(), "test-results", "a11y", "report");
+  const runDir = path.join(outRoot, RUN_TS);
 
   test("sanity: found routes to test", () => {
     expect(targetRoutes.length).toBeGreaterThan(0);
@@ -67,7 +93,7 @@ test.describe("a11y-crawl-all", () => {
 
       // If violations exist, write them to a JSON file whose name is derived from the route
       if (violations.length > 0) {
-        const outDir = path.resolve(process.cwd(), "test-results", "a11y");
+        const outDir = runDir;
 
         // Derive locale folder: prefer explicit A11Y_LOCALE, otherwise parse from route
         const explicitLocale = process.env.A11Y_LOCALE;
@@ -79,7 +105,15 @@ test.describe("a11y-crawl-all", () => {
         })();
         const localeFolder = (explicitLocale && explicitLocale.length > 0) ? explicitLocale : parsedFirstSeg;
 
-        const outDirPerLocale = path.join(outDir, localeFolder);
+        // Derive device folder from Playwright project name, e.g. "Desktop Chrome", "iPhone 15"
+        // This ensures per-device outputs do not overwrite each other.
+        const projectName = test.info().project.name || "unknown-device";
+        const deviceFolder = projectName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '') || 'unknown-device';
+
+        const outDirPerLocale = path.join(outDir, localeFolder, deviceFolder);
         try {
           fs.mkdirSync(outDirPerLocale, { recursive: true });
         } catch {}
@@ -94,7 +128,7 @@ test.describe("a11y-crawl-all", () => {
           // Store as an object with the route for easier aggregation downstream
           fs.writeFileSync(
             outPath,
-            JSON.stringify({ route, violations }, null, 2),
+            JSON.stringify({ route, device: projectName, violations }, null, 2),
             "utf8",
           );
         } catch {}
@@ -105,9 +139,11 @@ test.describe("a11y-crawl-all", () => {
   }
 
   async function page2file(): Promise<void> {
-    const outDir = path.resolve(process.cwd(), "test-results", "a11y");
+    const outDir = runDir; // limit aggregation to this run's folder
     try {
       if (!fs.existsSync(outDir)) return;
+      // Limit aggregation strictly to routes tested in this run
+      const targetRouteSet = new Set(targetRoutes);
       // Recursively walk a11y output dir to find page JSONs
       const foundFiles: string[] = [];
       const walk = (dir: string, rel = '') => {
@@ -120,7 +156,13 @@ test.describe("a11y-crawl-all", () => {
       };
       walk(outDir);
 
-      const summary = [] as Array<{ file: string; route: string; count: number; ids: string[] }>;
+      const summary = [] as Array<{
+        file: string;
+        route: string;
+        device?: string;
+        count: number;
+        ids: string[];
+      }>;
       for (const absFile of foundFiles) {
         try {
           const raw = fs.readFileSync(absFile, 'utf8');
@@ -129,26 +171,97 @@ test.describe("a11y-crawl-all", () => {
           if (!Array.isArray(violations) || violations.length === 0) continue;
           const route = typeof data?.route === 'string' && data.route ? data.route : undefined;
           const file = path.relative(outDir, absFile).replace(/\\/g, '/');
+          // Try to infer device from path: <locale>/<device>/<page>.json
+          const segs = file.split('/');
+          const inferredDevice = segs.length >= 3 ? segs[1] : undefined;
           // Fallback route guess from file name if not embedded
           const base = path.basename(absFile).replace(/\.json$/i, '');
           const routeGuess = base === 'root' ? '/' : `/${base.replace(/_/g, '/')}/`;
-          summary.push({ file, route: route ?? routeGuess, count: violations.length, ids: violations.map((v: any) => v?.id).filter(Boolean) });
+          const effectiveRoute = route ?? routeGuess;
+          // Skip stale files from previous runs that don't belong to this run's target routes
+          if (!targetRouteSet.has(effectiveRoute)) continue;
+          summary.push({
+            file,
+            route: effectiveRoute,
+            device: typeof data?.device === 'string' ? data.device : inferredDevice,
+            count: violations.length,
+            ids: violations.map((v: any) => v?.id).filter(Boolean),
+          });
         } catch {}
       }
+      // Always write an aggregate summary across all devices
       const localeTag = (process.env.A11Y_LOCALE ?? 'all').replace(/[^A-Za-z0-9_.-]/g, '_');
-      const deviceTag = (process.env.A11Y_DEVICE ?? 'all-devices').replace(/[^A-Za-z0-9_.-]/g, '_');
-      const outFile = `_summary.${localeTag}.${deviceTag}.json`;
-      const outPath = path.join(outDir, outFile);
+      const outAllFile = `_summary.${localeTag}.all-devices.json`;
+      const outAllPath = path.join(outDir, outAllFile);
       fs.writeFileSync(
-        outPath,
+        outAllPath,
         JSON.stringify(
           {
             generatedAt: new Date().toISOString(),
             locale: process.env.A11Y_LOCALE ?? null,
-            device: process.env.A11Y_DEVICE ?? null,
+            device: 'all-devices',
             pagesTested: targetRoutes.length,
             pagesWithViolations: summary.length,
             details: summary,
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      );
+
+      // Additionally, write per-device summaries by grouping by inferred/embedded device
+      const byDevice = new Map<string, typeof summary>();
+      for (const item of summary) {
+        const key = (item.device ?? 'unknown-device').toString();
+        if (!byDevice.has(key)) byDevice.set(key, []);
+        byDevice.get(key)!.push(item);
+      }
+      for (const [deviceKey, items] of byDevice) {
+        const deviceTag = deviceKey.replace(/[^A-Za-z0-9_.-]/g, '_');
+        const outDevFile = `_summary.${localeTag}.${deviceTag}.json`;
+        const outDevPath = path.join(outDir, outDevFile);
+        fs.writeFileSync(
+          outDevPath,
+          JSON.stringify(
+            {
+              generatedAt: new Date().toISOString(),
+              locale: process.env.A11Y_LOCALE ?? null,
+              device: deviceKey,
+              pagesTested: targetRoutes.length,
+              pagesWithViolations: items.length,
+              details: items,
+            },
+            null,
+            2,
+          ),
+          'utf8',
+        );
+      }
+
+      // ID-centric summary across all devices: group violation id -> routes[]
+      const idMap = new Map<string, Set<string>>();
+      for (const item of summary) {
+        const route = item.route;
+        for (const id of item.ids) {
+          if (!idMap.has(id)) idMap.set(id, new Set());
+          idMap.get(id)!.add(route);
+        }
+      }
+      const idDetails = Array.from(idMap.entries())
+        .map(([id, routes]) => ({ id, count: routes.size, routes: Array.from(routes).sort() }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+      const outIdsFile = `_summary.ids.${localeTag}.all-devices.json`;
+      const outIdsPath = path.join(outDir, outIdsFile);
+      fs.writeFileSync(
+        outIdsPath,
+        JSON.stringify(
+          {
+            generatedAt: new Date().toISOString(),
+            locale: process.env.A11Y_LOCALE ?? null,
+            device: 'all-devices',
+            uniqueIds: idDetails.length,
+            details: idDetails,
           },
           null,
           2,
